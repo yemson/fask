@@ -1,73 +1,78 @@
-# React + TypeScript + Vite
+# sound-send
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+브라우저 기반 FSK 송수신 실험 프로젝트입니다.  
+`TX` 페이지에서 텍스트를 음성 톤으로 송신하고, `RX` 페이지에서 마이크 입력을 받아 복원합니다.
 
-Currently, two official plugins are available:
+## 핵심 기능
+- `TX`: 프레임 생성 + FSK 송신
+- `RX`: 실시간 수신 + 상태머신 디코딩
+- V2 프로토콜
+  - 헤더 64bit: `PREAMBLE(32) + SYNC(16) + LEN_FLAG(16)`
+  - LEN_FLAG 최상위 1비트: 압축 플래그
+  - LEN_FLAG 하위 15비트: payload 바이트 길이(0~32767)
+- 조건부 압축(`pako`)
+  - `rawBytes >= 24`
+  - `compressedBytes + 2 < rawBytes` 일 때만 압축 사용
+- Ts 프리셋
+  - `Safe 120ms`, `Balanced 80ms`, `Fast 60ms`
+- RX 디버그 대시보드
+  - 레벨 바, 진단 배지, 스펙트럼, `f0/f1` 마커
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## 기술 스택
+- React 19
+- TypeScript
+- Vite
+- react-router-dom
+- pako
 
-## React Compiler
+## 라우트
+- `/tx`: 송신 페이지
+- `/rx`: 수신 페이지
+- `/`: `/tx`로 리다이렉트
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## 사용 방법
+1. 브라우저 탭 2개(또는 기기 2대)를 준비합니다.
+2. RX 탭에서 `/rx` 진입 후 `Start RX (Mic)` 실행합니다.
+3. TX 탭에서 `/tx` 진입 후 텍스트 입력 후 `Send (FSK)` 실행합니다.
+4. TX/RX의 Ts 프리셋을 반드시 동일하게 맞춥니다.
 
-## Expanding the ESLint configuration
+## 프로토콜(V2)
+프레임 구조:
+`[PREAMBLE_32][SYNC_16][LEN_FLAG_16][PAYLOAD_BITS]`
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+상수:
+- `PREAMBLE_BITS_V2 = "01".repeat(16)` (32bit)
+- `SYNC_BITS_V2 = "11110000".repeat(2)` (16bit)
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+LEN_FLAG 인코딩:
+- `value = (compressed ? 0x8000 : 0) | payloadByteLength`
+- `payloadByteLength` 범위: `0..32767`
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+## 압축 규칙
+압축 후보는 `deflateRaw` 결과를 사용합니다.
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+압축 사용 조건:
+- 원본 바이트 길이 `>= 24`
+- `compressedBytes + 2 < rawBytes`
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+조건 불충족 시 원본(payload raw) 그대로 전송합니다.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+RX 복원:
+- `compressed=true`면 `inflateRaw` 후 UTF-8 디코딩
+- `compressed=false`면 바로 UTF-8 디코딩
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+## FSK 파라미터
+기본 톤:
+- `f0 = 1200Hz`
+- `f1 = 2200Hz`
+
+Ts 프리셋:
+- `safe = 120ms`
+- `balanced = 80ms` (기본)
+- `fast = 60ms`
+
+예상 전송 시간(대략):
+- `총시간 ≈ 전체비트수 * Ts`
+
+## 주의 사항
+- 소음 환경에서 수신률이 낮으면 `Fast -> Balanced -> Safe` 순으로 낮춰 테스트하세요.

@@ -1,41 +1,54 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  FSK_F0_HZ,
+  FSK_F1_HZ,
+  TS_PROFILE_MS,
+  getTsSec,
+  readTsProfileFromStorage,
+  writeTsProfileToStorage,
+} from "../lib/fskConfig";
+import type { TsProfile } from "../lib/fskConfig";
+import {
+  buildFrameBitsV2,
+  PREAMBLE_BITS_V2,
+  SYNC_BITS_V2,
+} from "../lib/protocol";
+import type { EncodedFrame } from "../lib/protocol";
+
+const TS_PROFILES: TsProfile[] = ["safe", "balanced", "fast"];
+
+function getHeaderBitsLen() {
+  return PREAMBLE_BITS_V2.length + SYNC_BITS_V2.length + 16;
+}
+
+function profileLabel(profile: TsProfile) {
+  if (profile === "safe") return "Safe";
+  if (profile === "balanced") return "Balanced";
+  return "Fast";
+}
+
+function calcSavingPercent(rawBytes: number, txBytes: number) {
+  if (rawBytes <= 0) return 0;
+  return Math.max(0, ((rawBytes - txBytes) / rawBytes) * 100);
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
 
 export default function TxPage() {
   const [inputValue, setInputValue] = useState("");
   const [payloadBitsUI, setPayloadBitsUI] = useState("");
   const [frameBitsUI, setFrameBitsUI] = useState("");
+  const [frameInfo, setFrameInfo] = useState<EncodedFrame | null>(null);
+  const [txStatus, setTxStatus] = useState("idle");
+  const [tsProfile, setTsProfile] = useState<TsProfile>(() =>
+    readTsProfileFromStorage(),
+  );
 
-  // Encoding (text -> bytes -> bits)
-  const textToBytes = (text: string): Uint8Array =>
-    new TextEncoder().encode(text);
-
-  // MSB-first bits
-  const bytesToBitStream = (bytes: Uint8Array): string =>
-    Array.from(bytes, (b) => b.toString(2).padStart(8, "0")).join("");
-
-  const u16ToBits = (n: number): string => {
-    if (!Number.isInteger(n) || n < 0 || n > 0xffff)
-      throw new Error(`LEN out of range: ${n}`);
-    return n.toString(2).padStart(16, "0");
-  };
-
-  // [PREAMBLE(64b)][SYNC(16b)][LEN(16b, BYTES)][PAYLOAD(bits)]
-  const makeFrameBits = (
-    payloadBits: string,
-    payloadByteLen: number,
-  ): string => {
-    const preamble = "01".repeat(32); // 64 bits
-    const sync = "11110000".repeat(2); // 16 bits
-    const lenBits = u16ToBits(payloadByteLen); // 16 bits
-    const frame = `${preamble}${sync}${lenBits}${payloadBits}`;
-
-    const bad = frame.match(/[^01]/);
-    if (bad) throw new Error(`Frame contains non-bit char: "${bad[0]}"`);
-    if (payloadBits.length % 8 !== 0)
-      throw new Error("payloadBits must be multiple of 8");
-
-    return frame;
-  };
+  useEffect(() => {
+    writeTsProfileToStorage(tsProfile);
+  }, [tsProfile]);
 
   // FSK TX (bits -> sound)
   const audioRef = useRef<{
@@ -44,15 +57,16 @@ export default function TxPage() {
     gain: GainNode;
   } | null>(null);
 
+  const Ts = getTsSec(tsProfile);
   const params = useMemo(
     () => ({
-      f0: 1200,
-      f1: 2200,
-      Ts: 0.08, // 60ms per bit
+      f0: FSK_F0_HZ,
+      f1: FSK_F1_HZ,
+      Ts,
       fade: 0.004, // 4ms fade to reduce clicks
       volume: 0.08, // quiet
     }),
-    [],
+    [Ts],
   );
 
   const ensureAudio = () => {
@@ -96,19 +110,13 @@ export default function TxPage() {
     await h.ctx.resume();
 
     const { f0, f1, Ts, fade, volume } = params;
-
     const now = h.ctx.currentTime;
-    // Start slightly later for stable scheduling
     const t0 = now + 0.05;
 
-    // Prepare gain automation
     h.gain.gain.cancelScheduledValues(now);
     h.gain.gain.setValueAtTime(0, now);
-
-    // Prepare frequency automation
     h.osc.frequency.cancelScheduledValues(now);
 
-    // Schedule one oscillator and switch freq per bit
     for (let i = 0; i < bits.length; i++) {
       const b = bits.charCodeAt(i); // '0' or '1'
       const freq = b === 49 ? f1 : f0;
@@ -116,10 +124,8 @@ export default function TxPage() {
 
       h.osc.frequency.setValueAtTime(freq, t);
 
-      // Short fade in/out per symbol to reduce clicks
       const tInEnd = t + fade;
       const tOutStart = t + Ts - fade;
-
       h.gain.gain.setValueAtTime(0, t);
       h.gain.gain.linearRampToValueAtTime(volume, tInEnd);
       h.gain.gain.setValueAtTime(volume, tOutStart);
@@ -128,40 +134,45 @@ export default function TxPage() {
 
     const endTime = t0 + bits.length * Ts + 0.05;
     h.gain.gain.setValueAtTime(0, endTime);
+  };
 
-    console.log(
-      "TX scheduled bits:",
-      bits.length,
-      "duration(s):",
-      bits.length * Ts,
+  const buildFrame = (text: string) => {
+    const encoded = buildFrameBitsV2(text);
+    const headerBitsLen = getHeaderBitsLen();
+
+    setFrameInfo(encoded);
+    setFrameBitsUI(encoded.bits);
+    setPayloadBitsUI(encoded.bits.slice(headerBitsLen));
+
+    const saving = calcSavingPercent(encoded.rawBytes, encoded.txBytes);
+    setTxStatus(
+      `frame ready (${encoded.compressed ? "compressed" : "raw"} payload, ${encoded.txBytes}/${encoded.rawBytes}B, save ${saving.toFixed(1)}%)`,
     );
+
+    return encoded;
   };
 
   const handleBuild = () => {
-    const bytes = textToBytes(inputValue);
-    const payloadBits = bytesToBitStream(bytes);
-    const frameBits = makeFrameBits(payloadBits, bytes.length);
-
-    setPayloadBitsUI(payloadBits);
-    setFrameBitsUI(frameBits);
-
-    console.log("bytes.length =", bytes.length);
-    console.log("payloadBits.length =", payloadBits.length);
-    console.log("frameBits.length =", frameBits.length);
-    console.log("frameBits head =", frameBits.slice(0, 120));
+    try {
+      buildFrame(inputValue);
+    } catch (error) {
+      setTxStatus(`build error: ${getErrorMessage(error)}`);
+    }
   };
 
   const handleSend = async () => {
-    if (!frameBitsUI) handleBuild();
-    const bits =
-      frameBitsUI ||
-      makeFrameBits(
-        bytesToBitStream(textToBytes(inputValue)),
-        textToBytes(inputValue).length,
+    try {
+      const encoded = buildFrame(inputValue);
+      await playFrameBitsFSK(encoded.bits);
+      setTxStatus(
+        `sent ${encoded.bits.length} bits in ${(encoded.bits.length * Ts).toFixed(2)}s (${encoded.compressed ? "compressed" : "raw"})`,
       );
-
-    await playFrameBitsFSK(bits);
+    } catch (error) {
+      setTxStatus(`send error: ${getErrorMessage(error)}`);
+    }
   };
+
+  const saving = frameInfo ? calcSavingPercent(frameInfo.rawBytes, frameInfo.txBytes) : 0;
 
   return (
     <div style={{ padding: 16, fontFamily: "system-ui" }}>
@@ -190,9 +201,39 @@ export default function TxPage() {
         </button>
       </form>
 
-      <div style={{ marginTop: 12, fontSize: 12, opacity: 0.8 }}>
-        Params: f0={params.f0}Hz, f1={params.f1}Hz, Ts={params.Ts * 1000}ms/bit
+      <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {TS_PROFILES.map((profile) => (
+          <button
+            key={profile}
+            type="button"
+            onClick={() => setTsProfile(profile)}
+            style={{
+              padding: "6px 10px",
+              borderRadius: 8,
+              border: "1px solid #d0d7de",
+              background: tsProfile === profile ? "#111" : "#fff",
+              color: tsProfile === profile ? "#fff" : "#111",
+            }}
+          >
+            {profileLabel(profile)} {TS_PROFILE_MS[profile]}ms
+          </button>
+        ))}
       </div>
+
+      <div style={{ marginTop: 12, fontSize: 12, opacity: 0.85 }}>
+        Params: f0={params.f0}Hz, f1={params.f1}Hz, Ts={Math.round(Ts * 1000)}ms
+        {" "}
+        (profile: {profileLabel(tsProfile)})
+      </div>
+
+      <div style={{ marginTop: 8, fontSize: 12 }}>Status: {txStatus}</div>
+
+      {frameInfo && (
+        <div style={{ marginTop: 8, fontSize: 12, opacity: 0.9 }}>
+          rawBytes={frameInfo.rawBytes} txBytes={frameInfo.txBytes} compressed=
+          {frameInfo.compressed ? "on" : "off"} saving={saving.toFixed(1)}%
+        </div>
+      )}
 
       <div style={{ marginTop: 12 }}>
         <p style={{ margin: "8px 0 4px" }}>Payload bits:</p>

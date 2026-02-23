@@ -1,11 +1,28 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { inflateRaw } from "pako";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import SignalDashboard from "../components/rx/SignalDashboard";
+import {
+  FSK_F0_HZ,
+  FSK_F1_HZ,
+  TS_PROFILE_MS,
+  getTsSec,
+  readTsProfileFromStorage,
+  writeTsProfileToStorage,
+} from "../lib/fskConfig";
+import type { TsProfile } from "../lib/fskConfig";
+import { PREAMBLE_BITS_V2, SYNC_BITS_V2, parseLenFlagU16 } from "../lib/protocol";
 
 type RxState =
   | { mode: "search_preamble"; window: string }
-  | { mode: "search_sync"; window: string }
-  | { mode: "read_len"; bits: string }
-  | { mode: "read_payload"; lenBytes: number; bits: string };
+  | { mode: "search_sync"; window: string; invert: boolean }
+  | { mode: "read_len"; bits: string; invert: boolean }
+  | {
+      mode: "read_payload";
+      lenBytes: number;
+      bits: string;
+      invert: boolean;
+      compressed: boolean;
+    };
 
 export type SignalMetrics = {
   rmsDb: number;
@@ -24,15 +41,18 @@ export type SignalDiagnosis =
   | "likely_fsk"
   | "mismatch_freq_or_timing";
 
-const PREAMBLE_BITS = "01".repeat(32); // 64 bits
-const SYNC_BITS = "11110000".repeat(2); // 16 bits
+const PREAMBLE_BITS = PREAMBLE_BITS_V2; // 32 bits
+const SYNC_BITS = SYNC_BITS_V2; // 16 bits
+const PREAMBLE_MATCH_MIN = 28; // allow <= 4 bit errors in preamble
+const SYNC_MAX_ERRORS = 2; // allow <= 2 bit errors in sync
+const MAX_PAYLOAD_BYTES = 0x7fff;
 const EPS = 1e-12;
 const UI_UPDATE_MS = 100;
 const MAX_SPECTRUM_HZ = 4000;
-
-function bitsToU16(bits16: string) {
-  return parseInt(bits16, 2);
-}
+const TS_PROFILES: TsProfile[] = ["safe", "balanced", "fast"];
+const INVERTED_PREAMBLE_BITS = PREAMBLE_BITS.split("")
+  .map((b) => (b === "1" ? "0" : "1"))
+  .join("");
 
 function bitsToBytes(bits: string): Uint8Array {
   if (bits.length % 8 !== 0) throw new Error("bits length not multiple of 8");
@@ -42,6 +62,28 @@ function bitsToBytes(bits: string): Uint8Array {
     out[i] = parseInt(chunk, 2);
   }
   return out;
+}
+
+function flipBit(bit: string) {
+  return bit === "1" ? "0" : "1";
+}
+
+function countMatches(a: string, b: string) {
+  if (a.length !== b.length) return 0;
+  let matches = 0;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === b[i]) matches += 1;
+  }
+  return matches;
+}
+
+function hammingDistance(a: string, b: string) {
+  if (a.length !== b.length) return Number.POSITIVE_INFINITY;
+  let errors = 0;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) errors += 1;
+  }
+  return errors;
 }
 
 // Goertzel: calculate power at target frequency from time-domain samples.
@@ -187,21 +229,54 @@ function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function profileLabel(profile: TsProfile) {
+  if (profile === "safe") return "Safe";
+  if (profile === "balanced") return "Balanced";
+  return "Fast";
+}
+
+function nextPowerOfTwo(n: number) {
+  let v = 32;
+  while (v < n && v < 32768) v *= 2;
+  return v;
+}
+
+function normalizeInflatedBytes(data: unknown): Uint8Array {
+  if (data instanceof Uint8Array) return data;
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (typeof data === "string") return new TextEncoder().encode(data);
+  throw new Error("unsupported inflate result type");
+}
+
 export default function RxPage() {
-  // Should match TX values.
-  const f0 = 1200;
-  const f1 = 2200;
-  const Ts = 0.08; // 80ms / bit
+  const f0 = FSK_F0_HZ;
+  const f1 = FSK_F1_HZ;
+
+  const [tsProfile, setTsProfile] = useState<TsProfile>(() =>
+    readTsProfileFromStorage(),
+  );
+  const Ts = getTsSec(tsProfile);
+
+  useEffect(() => {
+    writeTsProfileToStorage(tsProfile);
+  }, [tsProfile]);
 
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("idle");
   const [lastBit, setLastBit] = useState<string>("");
-  const [debug, setDebug] = useState<{ p0: number; p1: number; snr: number } | null>(
-    null,
-  );
+  const [debug, setDebug] = useState<{
+    p0: number;
+    p1: number;
+    snr: number;
+  } | null>(null);
   const [metrics, setMetrics] = useState<SignalMetrics | null>(null);
   const [diagnosis, setDiagnosis] = useState<SignalDiagnosis>("no_input");
-  const [spectrum, setSpectrum] = useState<Float32Array<ArrayBuffer> | null>(null);
+  const [spectrum, setSpectrum] = useState<Float32Array<ArrayBuffer> | null>(
+    null,
+  );
 
   const [decodedText, setDecodedText] = useState("");
   const [decodedLen, setDecodedLen] = useState<number | null>(null);
@@ -217,6 +292,7 @@ export default function RxPage() {
 
   // Analysis buffers.
   const tdRef = useRef<Float32Array<ArrayBuffer> | null>(null);
+  const tdFftRef = useRef<Float32Array<ArrayBuffer> | null>(null);
   const fdRef = useRef<Float32Array<ArrayBuffer> | null>(null);
   const lastSampleAtRef = useRef<number>(0);
   const lastUiUpdateAtRef = useRef<number>(0);
@@ -246,6 +322,7 @@ export default function RxPage() {
     }
 
     tdRef.current = null;
+    tdFftRef.current = null;
     fdRef.current = null;
     setLastBit("");
     setDebug(null);
@@ -255,29 +332,52 @@ export default function RxPage() {
     setStatus("idle");
   }, []);
 
-  function consumeBit(bit: string) {
+  function consumeBit(rawBit: string) {
     const st = rxStateRef.current;
 
-    const pushWindow = (window: string, maxLen: number) => {
-      return (window + bit).slice(-maxLen);
+    const pushWindow = (window: string, maxLen: number, nextBit: string) => {
+      return (window + nextBit).slice(-maxLen);
     };
 
     if (st.mode === "search_preamble") {
-      const w = pushWindow(st.window, PREAMBLE_BITS.length);
+      const w = pushWindow(st.window, PREAMBLE_BITS.length, rawBit);
       rxStateRef.current = { mode: "search_preamble", window: w };
-      if (w === PREAMBLE_BITS) {
-        setStatus("preamble ok, find sync...");
-        rxStateRef.current = { mode: "search_sync", window: "" };
+
+      if (w.length === PREAMBLE_BITS.length) {
+        const normalMatches = countMatches(w, PREAMBLE_BITS);
+        const invertedMatches = countMatches(w, INVERTED_PREAMBLE_BITS);
+        if (
+          normalMatches >= PREAMBLE_MATCH_MIN ||
+          invertedMatches >= PREAMBLE_MATCH_MIN
+        ) {
+          const invert = invertedMatches > normalMatches;
+          const best = Math.max(normalMatches, invertedMatches);
+          setStatus(`preamble ok (${best}/${PREAMBLE_BITS.length}), find sync...`);
+          rxStateRef.current = { mode: "search_sync", window: "", invert };
+        }
       }
       return;
     }
 
+    const bit = st.invert ? flipBit(rawBit) : rawBit;
+
     if (st.mode === "search_sync") {
-      const w = pushWindow(st.window, SYNC_BITS.length);
-      rxStateRef.current = { mode: "search_sync", window: w };
-      if (w === SYNC_BITS) {
-        setStatus("sync ok, read len...");
-        rxStateRef.current = { mode: "read_len", bits: "" };
+      const w = pushWindow(st.window, SYNC_BITS.length, bit);
+      rxStateRef.current = {
+        mode: "search_sync",
+        window: w,
+        invert: st.invert,
+      };
+      if (w.length === SYNC_BITS.length) {
+        const errors = hammingDistance(w, SYNC_BITS);
+        if (errors <= SYNC_MAX_ERRORS) {
+          setStatus(`sync ok (err=${errors}), read len...`);
+          rxStateRef.current = {
+            mode: "read_len",
+            bits: "",
+            invert: st.invert,
+          };
+        }
       }
       return;
     }
@@ -285,12 +385,27 @@ export default function RxPage() {
     if (st.mode === "read_len") {
       const bits = st.bits + bit;
       if (bits.length < 16) {
-        rxStateRef.current = { mode: "read_len", bits };
+        rxStateRef.current = { mode: "read_len", bits, invert: st.invert };
       } else {
-        const lenBytes = bitsToU16(bits);
+        const { compressed, lenBytes } = parseLenFlagU16(bits);
+        if (lenBytes > MAX_PAYLOAD_BYTES) {
+          setDecodedLen(null);
+          setStatus(`invalid len=${lenBytes}, resync...`);
+          rxStateRef.current = { mode: "search_preamble", window: "" };
+          return;
+        }
+
         setDecodedLen(lenBytes);
-        setStatus(`len=${lenBytes} bytes, read payload...`);
-        rxStateRef.current = { mode: "read_payload", lenBytes, bits: "" };
+        setStatus(
+          `len=${lenBytes} bytes (${compressed ? "compressed" : "raw"}), read payload...`,
+        );
+        rxStateRef.current = {
+          mode: "read_payload",
+          lenBytes,
+          bits: "",
+          invert: st.invert,
+          compressed,
+        };
       }
       return;
     }
@@ -300,14 +415,25 @@ export default function RxPage() {
       const bits = st.bits + bit;
 
       if (bits.length < needBits) {
-        rxStateRef.current = { mode: "read_payload", lenBytes: st.lenBytes, bits };
+        rxStateRef.current = {
+          mode: "read_payload",
+          lenBytes: st.lenBytes,
+          bits,
+          invert: st.invert,
+          compressed: st.compressed,
+        };
       } else {
         try {
           const payloadBits = bits.slice(0, needBits);
-          const bytes = bitsToBytes(payloadBits);
-          const text = new TextDecoder().decode(bytes);
+          const payloadBytes = bitsToBytes(payloadBits);
+          const decodedBytes = st.compressed
+            ? normalizeInflatedBytes(inflateRaw(payloadBytes))
+            : payloadBytes;
+          const text = new TextDecoder().decode(decodedBytes);
           setDecodedText(text);
-          setStatus("DONE. back to preamble search.");
+          setStatus(
+            `DONE (${st.compressed ? "compressed payload" : "raw payload"}). back to preamble search.`,
+          );
         } catch (error) {
           setStatus(`decode error: ${getErrorMessage(error)}`);
         } finally {
@@ -340,18 +466,19 @@ export default function RxPage() {
 
     const source = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
-    analyser.fftSize = 4096;
     analyser.smoothingTimeConstant = 0;
     analyser.minDecibels = -120;
     analyser.maxDecibels = -10;
 
     source.connect(analyser);
-
     audioRef.current = { ctx, stream, source, analyser };
 
-    // Number of samples per bit.
+    // Number of samples in one bit window.
     const N = Math.max(128, Math.round(ctx.sampleRate * Ts));
+    analyser.fftSize = nextPowerOfTwo(N);
+
     tdRef.current = new Float32Array(N);
+    tdFftRef.current = new Float32Array(analyser.fftSize);
     fdRef.current = new Float32Array(analyser.frequencyBinCount);
 
     lastSampleAtRef.current = ctx.currentTime;
@@ -362,10 +489,12 @@ export default function RxPage() {
     const loop = () => {
       const h = audioRef.current;
       const td = tdRef.current;
+      const tdFft = tdFftRef.current;
       const fd = fdRef.current;
-      if (!h || !td || !fd) return;
+      if (!h || !td || !tdFft || !fd) return;
 
-      h.analyser.getFloatTimeDomainData(td);
+      h.analyser.getFloatTimeDomainData(tdFft);
+      td.set(tdFft.subarray(tdFft.length - td.length));
       h.analyser.getFloatFrequencyData(fd);
 
       const p0 = goertzelPower(td, h.ctx.sampleRate, f0);
@@ -373,8 +502,16 @@ export default function RxPage() {
       const snr = Math.max(p0, p1) / (Math.min(p0, p1) + EPS);
 
       const rmsDb = computeRmsDb(td);
-      const noiseFloorDb = estimateNoiseFloorDb(fd, h.ctx.sampleRate, MAX_SPECTRUM_HZ);
-      const { peakHz, peakDb } = findPeak(fd, h.ctx.sampleRate, MAX_SPECTRUM_HZ);
+      const noiseFloorDb = estimateNoiseFloorDb(
+        fd,
+        h.ctx.sampleRate,
+        MAX_SPECTRUM_HZ,
+      );
+      const { peakHz, peakDb } = findPeak(
+        fd,
+        h.ctx.sampleRate,
+        MAX_SPECTRUM_HZ,
+      );
       const toneDeltaDb = calcToneDeltaDb(
         fd,
         h.ctx.sampleRate,
@@ -397,15 +534,12 @@ export default function RxPage() {
       // Keep bit decoding at Ts cadence.
       const now = h.ctx.currentTime;
       if (now - lastSampleAtRef.current >= Ts) {
-        lastSampleAtRef.current = now;
+        const steps = Math.floor((now - lastSampleAtRef.current) / Ts);
+        lastSampleAtRef.current += steps * Ts;
 
-        if (snr < 1.2) {
-          setLastBit("");
-        } else {
-          const bit = p1 > p0 ? "1" : "0";
-          setLastBit(bit);
-          consumeBit(bit);
-        }
+        const bit = p1 > p0 ? "1" : "0";
+        setLastBit(bit);
+        consumeBit(bit);
       }
 
       // UI metrics/spectrum update every 100ms to reduce rerenders.
@@ -430,11 +564,13 @@ export default function RxPage() {
     };
   }, [stopRx]);
 
+  const tsLabel = useMemo(() => profileLabel(tsProfile), [tsProfile]);
+
   return (
     <div style={{ padding: 16, fontFamily: "system-ui" }}>
       <h2>FSK RX</h2>
 
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         {!running ? (
           <button
             onClick={async () => {
@@ -453,8 +589,30 @@ export default function RxPage() {
         )}
 
         <div style={{ fontSize: 12, opacity: 0.85 }}>
-          f0={f0}Hz, f1={f1}Hz, Ts={Math.round(Ts * 1000)}ms
+          f0={f0}Hz, f1={f1}Hz, Ts={Math.round(Ts * 1000)}ms (profile: {tsLabel})
         </div>
+      </div>
+
+      <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {TS_PROFILES.map((profile) => (
+          <button
+            key={profile}
+            type="button"
+            disabled={running}
+            onClick={() => setTsProfile(profile)}
+            style={{
+              padding: "6px 10px",
+              borderRadius: 8,
+              border: "1px solid #d0d7de",
+              background: tsProfile === profile ? "#111" : "#fff",
+              color: tsProfile === profile ? "#fff" : "#111",
+              opacity: running ? 0.7 : 1,
+            }}
+            title={running ? "Stop RX before changing Ts profile" : ""}
+          >
+            {profileLabel(profile)} {TS_PROFILE_MS[profile]}ms
+          </button>
+        ))}
       </div>
 
       <SignalDashboard
@@ -474,9 +632,8 @@ export default function RxPage() {
         <div>LEN: {decodedLen ?? "-"}</div>
         {debug && (
           <div style={{ fontSize: 12, opacity: 0.85 }}>
-            p0={debug.p0.toExponential(2)} p1={debug.p1.toExponential(2)}
-            {" "}
-            snr~{debug.snr.toFixed(2)}
+            p0={debug.p0.toExponential(2)} p1={debug.p1.toExponential(2)} snr~
+            {debug.snr.toFixed(2)}
           </div>
         )}
         {metrics && (
@@ -501,13 +658,6 @@ export default function RxPage() {
         >
           {decodedText || "(none)"}
         </pre>
-      </div>
-
-      <div style={{ marginTop: 10, fontSize: 12, opacity: 0.8 }}>
-        Tip: test with a fixed pattern (1010...) from TX first, and check if
-        "Last bit" alternates.
-        <br />
-        If not, try Ts=120ms or wider f0/f1 spacing (example: 1000/2500).
       </div>
     </div>
   );
