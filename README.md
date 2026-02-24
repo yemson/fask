@@ -1,78 +1,54 @@
-# fask(fast fsk)
+# sound-send (FSK V2)
 
-브라우저 기반 FSK 송수신 실험 프로젝트입니다.  
-`TX` 페이지에서 텍스트를 음성 톤으로 송신하고, `RX` 페이지에서 마이크 입력을 받아 복원합니다.
+브라우저에서 텍스트를 FSK 톤으로 송신(TX)하고, 마이크로 수신(RX)하는 실험 프로젝트입니다.
+현재 프로토콜은 **V2 고정**입니다.
 
-## 핵심 기능
-- `TX`: 프레임 생성 + FSK 송신
-- `RX`: 실시간 수신 + 상태머신 디코딩
-- V2 프로토콜
-  - 헤더 64bit: `PREAMBLE(32) + SYNC(16) + LEN_FLAG(16)`
-  - LEN_FLAG 최상위 1비트: 압축 플래그
-  - LEN_FLAG 하위 15비트: payload 바이트 길이(0~32767)
-- 조건부 압축(`pako`)
-  - `rawBytes >= 24`
-  - `compressedBytes + 2 < rawBytes` 일 때만 압축 사용
-- Ts 프리셋
-  - `Safe 120ms`, `Balanced 80ms`, `Fast 60ms`
-- RX 디버그 대시보드
-  - 레벨 바, 진단 배지, 스펙트럼, `f0/f1` 마커
+## 빠른 시작
+```bash
+pnpm install
+pnpm dev
+```
 
-## 기술 스택
-- React 19
-- TypeScript
-- Vite
-- react-router-dom
-- pako
+- TX: `http://localhost:5173/tx`
+- RX: `http://localhost:5173/rx`
 
-## 라우트
-- `/tx`: 송신 페이지
-- `/rx`: 수신 페이지
-- `/`: `/tx`로 리다이렉트
-
-## 사용 방법
-1. 브라우저 탭 2개(또는 기기 2대)를 준비합니다.
-2. RX 탭에서 `/rx` 진입 후 `Start RX (Mic)` 실행합니다.
-3. TX 탭에서 `/tx` 진입 후 텍스트 입력 후 `Send (FSK)` 실행합니다.
-4. TX/RX의 Ts 프리셋을 반드시 동일하게 맞춥니다.
+## 사용 순서
+1. RX 페이지에서 `Start RX`를 누릅니다.
+2. TX 페이지에서 텍스트를 입력하고 `Send`를 누릅니다.
+3. TX/RX의 Ts 프로파일을 **같게** 맞춥니다.
+   - `Safe 120ms` (권장 시작)
+   - `Balanced 80ms`
+   - `Fast 60ms`
 
 ## 프로토콜(V2)
-프레임 구조:
+프레임:
 `[PREAMBLE_32][SYNC_16][LEN_FLAG_16][PAYLOAD_BITS]`
 
-상수:
-- `PREAMBLE_BITS_V2 = "01".repeat(16)` (32bit)
-- `SYNC_BITS_V2 = "11110000".repeat(2)` (16bit)
+- `PREAMBLE_BITS_V2 = "01".repeat(16)`
+- `SYNC_BITS_V2 = "11110000".repeat(2)`
+- LEN_FLAG:
+  - 최상위 1비트: compressed flag
+  - 하위 15비트: payload byte length (`0..32767`)
 
-LEN_FLAG 인코딩:
-- `value = (compressed ? 0x8000 : 0) | payloadByteLength`
-- `payloadByteLength` 범위: `0..32767`
-
-## 압축 규칙
-압축 후보는 `deflateRaw` 결과를 사용합니다.
-
-압축 사용 조건:
+압축 규칙:
 - 원본 바이트 길이 `>= 24`
-- `compressedBytes + 2 < rawBytes`
+- `compressedBytes + 2 < rawBytes` 일 때만 압축
 
-조건 불충족 시 원본(payload raw) 그대로 전송합니다.
+## 트러블슈팅
+- 디코딩이 안 될 때
+  - Ts를 양쪽 모두 `Safe 120ms`로 맞추고 다시 테스트
+  - RX 입력 레벨/진단 배지에서 `Likely FSK`가 나오는지 확인
+- `invalid len` / `decode error`가 반복될 때
+  - 스피커 볼륨을 올리고 마이크를 더 가깝게
+  - 주변 소음을 줄이고 다시 시도
+- 탭 전환 후 수신이 불안정할 때
+  - RX 탭이 너무 오래 비활성 상태가 되지 않게 테스트
+  - 가능하면 창 2개 또는 기기 2대로 테스트
 
-RX 복원:
-- `compressed=true`면 `inflateRaw` 후 UTF-8 디코딩
-- `compressed=false`면 바로 UTF-8 디코딩
-
-## FSK 파라미터
-기본 톤:
-- `f0 = 1200Hz`
-- `f1 = 2200Hz`
-
-Ts 프리셋:
-- `safe = 120ms`
-- `balanced = 80ms` (기본)
-- `fast = 60ms`
-
-예상 전송 시간(대략):
-- `총시간 ≈ 전체비트수 * Ts`
-
-## 주의 사항
-- 소음 환경에서 수신률이 낮으면 `Fast -> Balanced -> Safe` 순으로 낮춰 테스트하세요.
+## 스크립트
+```bash
+pnpm dev
+pnpm lint
+pnpm test
+pnpm build
+```

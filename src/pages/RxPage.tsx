@@ -18,6 +18,10 @@ const UI_UPDATE_MS = 100;
 const MAX_SPECTRUM_HZ = 4000;
 const TS_PROFILES: TsProfile[] = ["safe", "balanced", "fast"];
 
+const MIN_DECODE_RMS_DB = -58;
+const MIN_DECODE_SNR = 1.2;
+const MIN_DECODE_TONE_DELTA_DB = 8;
+
 function goertzelPower(
   samples: Float32Array<ArrayBufferLike>,
   sampleRate: number,
@@ -129,8 +133,7 @@ function calcToneDeltaDb(
 ) {
   const tone0Db = getToneDb(spectrum, sampleRate, f0);
   const tone1Db = getToneDb(spectrum, sampleRate, f1);
-  const tonePeakDb = Math.max(tone0Db, tone1Db);
-  return tonePeakDb - noiseFloorDb;
+  return Math.max(tone0Db, tone1Db) - noiseFloorDb;
 }
 
 function sliceSpectrum(
@@ -171,54 +174,11 @@ function nextPowerOfTwo(n: number) {
   return v;
 }
 
-function chooseBitByTripleWindow(
-  samples: Float32Array<ArrayBufferLike>,
-  sampleRate: number,
-  f0: number,
-  f1: number,
-) {
-  const n = samples.length;
-  const windowLen = Math.max(64, Math.floor(n / 2));
-  const centers = [Math.floor(n * 0.25), Math.floor(n * 0.5), Math.floor(n * 0.75)];
-
-  const bits: ("0" | "1")[] = [];
-  let p0Sum = 0;
-  let p1Sum = 0;
-
-  for (let i = 0; i < centers.length; i++) {
-    const center = centers[i];
-    const start = Math.max(0, Math.min(n - windowLen, center - Math.floor(windowLen / 2)));
-    const end = Math.min(n, start + windowLen);
-    const view = samples.subarray(start, end);
-
-    const p0 = goertzelPower(view, sampleRate, f0);
-    const p1 = goertzelPower(view, sampleRate, f1);
-    p0Sum += p0;
-    p1Sum += p1;
-    bits.push(p1 > p0 ? "1" : "0");
-  }
-
-  const ones = bits.filter((b) => b === "1").length;
-  const decodedBit = ones >= 2 ? "1" : "0";
-
-  const p0Avg = p0Sum / bits.length;
-  const p1Avg = p1Sum / bits.length;
-
-  return {
-    p0: p0Avg,
-    p1: p1Avg,
-    bit: decodedBit,
-    snr: Math.max(p0Avg, p1Avg) / (Math.min(p0Avg, p1Avg) + EPS),
-  };
-}
-
 function initialDecoderStats(): DecoderStats {
   return {
     okFrames: 0,
-    crcFail: 0,
     lenInvalid: 0,
     decodeFail: 0,
-    syncLost: 0,
     resyncCount: 0,
     lastError: null,
   };
@@ -238,12 +198,7 @@ function chipClass(active: boolean) {
 }
 
 export default function RxPage() {
-  const f0 = FSK_F0_HZ;
-  const f1 = FSK_F1_HZ;
-
-  const [tsProfile, setTsProfile] = useState<TsProfile>(() =>
-    readTsProfileFromStorage(),
-  );
+  const [tsProfile, setTsProfile] = useState<TsProfile>(() => readTsProfileFromStorage());
   const Ts = getTsSec(tsProfile);
 
   useEffect(() => {
@@ -253,6 +208,10 @@ export default function RxPage() {
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("idle");
   const [lastBit, setLastBit] = useState<string>("");
+  const [decodedText, setDecodedText] = useState("");
+  const [decodedLen, setDecodedLen] = useState<number | null>(null);
+  const [decoderStats, setDecoderStats] = useState<DecoderStats>(initialDecoderStats);
+
   const [debug, setDebug] = useState<{
     p0: number;
     p1: number;
@@ -261,14 +220,6 @@ export default function RxPage() {
   const [metrics, setMetrics] = useState<SignalMetrics | null>(null);
   const [diagnosis, setDiagnosis] = useState<SignalDiagnosis>("no_input");
   const [spectrum, setSpectrum] = useState<Float32Array<ArrayBuffer> | null>(null);
-  const [devMode, setDevMode] = useState(false);
-  const [allowV2Fallback, setAllowV2Fallback] = useState(false);
-
-  const [decodedText, setDecodedText] = useState("");
-  const [decodedLen, setDecodedLen] = useState<number | null>(null);
-  const [decodedVersion, setDecodedVersion] = useState<"v2" | "v3" | null>(null);
-  const [decodedSeq, setDecodedSeq] = useState<number | null>(null);
-  const [decoderStats, setDecoderStats] = useState<DecoderStats>(initialDecoderStats);
 
   const audioRef = useRef<{
     ctx: AudioContext;
@@ -278,13 +229,14 @@ export default function RxPage() {
   } | null>(null);
 
   const rafRef = useRef<number | null>(null);
-
   const tdRef = useRef<Float32Array<ArrayBuffer> | null>(null);
   const tdFftRef = useRef<Float32Array<ArrayBuffer> | null>(null);
   const fdRef = useRef<Float32Array<ArrayBuffer> | null>(null);
   const lastSampleAtRef = useRef<number>(0);
   const lastUiUpdateAtRef = useRef<number>(0);
-  const decoderRef = useRef<RxBitDecoder>(new RxBitDecoder({ allowV2Fallback: false }));
+
+  const decoderRef = useRef<RxBitDecoder>(new RxBitDecoder());
+  const weakSignalGateRef = useRef(false);
 
   const stopRx = useCallback(async () => {
     setRunning(false);
@@ -310,6 +262,8 @@ export default function RxPage() {
     tdRef.current = null;
     tdFftRef.current = null;
     fdRef.current = null;
+    weakSignalGateRef.current = false;
+
     setLastBit("");
     setDebug(null);
     setMetrics(null);
@@ -319,15 +273,13 @@ export default function RxPage() {
   }, []);
 
   const resetDecoder = useCallback(() => {
-    decoderRef.current = new RxBitDecoder({ allowV2Fallback });
+    decoderRef.current = new RxBitDecoder();
     setDecoderStats(decoderRef.current.getStats());
-  }, [allowV2Fallback]);
+  }, []);
 
   async function startRx() {
     setDecodedText("");
     setDecodedLen(null);
-    setDecodedVersion(null);
-    setDecodedSeq(null);
     setStatus("request mic...");
     setLastBit("");
     setDebug(null);
@@ -336,6 +288,7 @@ export default function RxPage() {
     setSpectrum(null);
 
     resetDecoder();
+    weakSignalGateRef.current = false;
 
     const ctx = new AudioContext();
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -356,15 +309,16 @@ export default function RxPage() {
     source.connect(analyser);
     audioRef.current = { ctx, stream, source, analyser };
 
-    const N = Math.max(128, Math.round(ctx.sampleRate * Ts));
-    analyser.fftSize = nextPowerOfTwo(N);
+    const sampleCount = Math.max(128, Math.round(ctx.sampleRate * Ts));
+    analyser.fftSize = nextPowerOfTwo(sampleCount);
 
-    tdRef.current = new Float32Array(N);
+    tdRef.current = new Float32Array(sampleCount);
     tdFftRef.current = new Float32Array(analyser.fftSize);
     fdRef.current = new Float32Array(analyser.frequencyBinCount);
 
     lastSampleAtRef.current = ctx.currentTime;
     lastUiUpdateAtRef.current = 0;
+
     setRunning(true);
     setStatus("listening...");
 
@@ -379,66 +333,96 @@ export default function RxPage() {
       td.set(tdFft.subarray(tdFft.length - td.length));
       h.analyser.getFloatFrequencyData(fd);
 
-      const sample = chooseBitByTripleWindow(td, h.ctx.sampleRate, f0, f1);
+      const p0 = goertzelPower(td, h.ctx.sampleRate, FSK_F0_HZ);
+      const p1 = goertzelPower(td, h.ctx.sampleRate, FSK_F1_HZ);
+      const snr = Math.max(p0, p1) / (Math.min(p0, p1) + EPS);
+      const bit = p1 > p0 ? "1" : "0";
+
       const rmsDb = computeRmsDb(td);
       const noiseFloorDb = estimateNoiseFloorDb(fd, h.ctx.sampleRate, MAX_SPECTRUM_HZ);
       const { peakHz, peakDb } = findPeak(fd, h.ctx.sampleRate, MAX_SPECTRUM_HZ);
-      const toneDeltaDb = calcToneDeltaDb(fd, h.ctx.sampleRate, f0, f1, noiseFloorDb);
+      const toneDeltaDb = calcToneDeltaDb(
+        fd,
+        h.ctx.sampleRate,
+        FSK_F0_HZ,
+        FSK_F1_HZ,
+        noiseFloorDb,
+      );
 
       const nextMetrics: SignalMetrics = {
         rmsDb,
-        p0: sample.p0,
-        p1: sample.p1,
-        snr: sample.snr,
+        p0,
+        p1,
+        snr,
         toneDeltaDb,
         peakHz,
         peakDb,
         noiseFloorDb,
       };
 
+      const canDecodeSymbol =
+        nextMetrics.rmsDb >= MIN_DECODE_RMS_DB &&
+        nextMetrics.snr >= MIN_DECODE_SNR &&
+        nextMetrics.toneDeltaDb >= MIN_DECODE_TONE_DELTA_DB;
+
       const now = h.ctx.currentTime;
       if (now - lastSampleAtRef.current >= Ts) {
         const steps = Math.floor((now - lastSampleAtRef.current) / Ts);
         if (steps > 1) {
-          // If UI/audio loop lags, do not inject duplicated bits into the decoder.
-          // Resync sampling clock to "now" and consume only one fresh symbol.
+          // Decoder should consume one fresh symbol per cycle to avoid duplicated stale bits.
           lastSampleAtRef.current = now;
         } else {
           lastSampleAtRef.current += Ts;
         }
 
-        const latestEvent = decoderRef.current.consumeBit(sample.bit);
+        if (!canDecodeSymbol) {
+          setLastBit("-");
 
-        setLastBit(sample.bit);
-
-        if (latestEvent) {
-          if (latestEvent.kind === "status") {
-            setStatus(latestEvent.message);
-            if (typeof latestEvent.lenBytes === "number") {
-              setDecodedLen(latestEvent.lenBytes);
+          if (!weakSignalGateRef.current) {
+            weakSignalGateRef.current = true;
+            if (decoderRef.current.getMode() !== "search_preamble") {
+              decoderRef.current.reset();
+              setStatus("signal weak/noisy, decoder reset. waiting preamble...");
+            } else {
+              setStatus("signal weak/noisy, waiting clean tone...");
             }
           }
-
-          if (latestEvent.kind === "error") {
-            setStatus(latestEvent.message);
+        } else {
+          if (weakSignalGateRef.current) {
+            weakSignalGateRef.current = false;
+            setStatus("signal recovered, searching preamble...");
           }
 
-          if (latestEvent.kind === "frame") {
-            setDecodedText(latestEvent.frame.text);
-            setDecodedLen(latestEvent.frame.lenBytes);
-            setDecodedVersion(latestEvent.frame.version);
-            setDecodedSeq(latestEvent.frame.seq);
-            setStatus(latestEvent.message);
-          }
+          const event = decoderRef.current.consumeBit(bit);
+          setLastBit(bit);
 
-          setDecoderStats(decoderRef.current.getStats());
+          if (event) {
+            if (event.kind === "status") {
+              setStatus(event.message);
+              if (typeof event.lenBytes === "number") {
+                setDecodedLen(event.lenBytes);
+              }
+            }
+
+            if (event.kind === "error") {
+              setStatus(event.message);
+            }
+
+            if (event.kind === "frame") {
+              setDecodedText(event.frame.text);
+              setDecodedLen(event.frame.lenBytes);
+              setStatus(event.message);
+            }
+
+            setDecoderStats(decoderRef.current.getStats());
+          }
         }
       }
 
       const nowMs = performance.now();
       if (nowMs - lastUiUpdateAtRef.current >= UI_UPDATE_MS) {
         lastUiUpdateAtRef.current = nowMs;
-        setDebug({ p0: sample.p0, p1: sample.p1, snr: sample.snr });
+        setDebug({ p0, p1, snr });
         setMetrics(nextMetrics);
         setDiagnosis(diagnoseSignal(nextMetrics));
         setSpectrum(sliceSpectrum(fd, h.ctx.sampleRate, MAX_SPECTRUM_HZ));
@@ -456,18 +440,12 @@ export default function RxPage() {
     };
   }, [stopRx]);
 
-  useEffect(() => {
-    if (!running) {
-      resetDecoder();
-    }
-  }, [allowV2Fallback, running, resetDecoder]);
-
   const tsLabel = useMemo(() => profileLabel(tsProfile), [tsProfile]);
 
   return (
     <section className="grid gap-4 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
       <div className={cardClass()}>
-        <h2 className="mb-4 text-xl font-bold text-slate-900">FSK RX</h2>
+        <h2 className="mb-4 text-xl font-bold text-slate-900">FSK RX (V2)</h2>
 
         <div className="flex flex-wrap items-center gap-2">
           {!running ? (
@@ -494,7 +472,7 @@ export default function RxPage() {
           )}
 
           <span className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700">
-            f0={f0}Hz f1={f1}Hz Ts={Math.round(Ts * 1000)}ms ({tsLabel}, v3)
+            f0={FSK_F0_HZ}Hz f1={FSK_F1_HZ}Hz Ts={Math.round(Ts * 1000)}ms ({tsLabel}, v2)
           </span>
         </div>
 
@@ -513,35 +491,10 @@ export default function RxPage() {
           ))}
         </div>
 
-        <div className="mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-700">
-          <label className="flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5">
-            <input
-              type="checkbox"
-              checked={devMode}
-              onChange={(e) => {
-                const next = e.target.checked;
-                setDevMode(next);
-                if (!next) setAllowV2Fallback(false);
-              }}
-            />
-            Developer mode
-          </label>
-
-          <label className="flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5">
-            <input
-              type="checkbox"
-              checked={allowV2Fallback}
-              disabled={!devMode || running}
-              onChange={(e) => setAllowV2Fallback(e.target.checked)}
-            />
-            V2 fallback
-          </label>
-        </div>
-
         <SignalDashboard
           running={running}
-          f0={f0}
-          f1={f1}
+          f0={FSK_F0_HZ}
+          f1={FSK_F1_HZ}
           metrics={metrics}
           diagnosis={diagnosis}
           spectrum={spectrum}
@@ -553,12 +506,10 @@ export default function RxPage() {
 
         <div className="mt-4 grid gap-2 text-sm">
           <div className="rounded-xl border border-slate-200 bg-white p-3">Status: {status}</div>
-          <div className="rounded-xl border border-slate-200 bg-white p-3">Last bit: <b>{lastBit || "-"}</b></div>
-          <div className="rounded-xl border border-slate-200 bg-white p-3">LEN: {decodedLen ?? "-"}</div>
           <div className="rounded-xl border border-slate-200 bg-white p-3">
-            Last frame: {decodedVersion ?? "-"}
-            {decodedSeq !== null ? ` (seq=${decodedSeq})` : ""}
+            Last bit: <b>{lastBit || "-"}</b>
           </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-3">LEN: {decodedLen ?? "-"}</div>
         </div>
 
         {debug && (
@@ -566,6 +517,7 @@ export default function RxPage() {
             p0={debug.p0.toExponential(2)} p1={debug.p1.toExponential(2)} snr~{debug.snr.toFixed(2)}
           </div>
         )}
+
         {metrics && (
           <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-700">
             rms={metrics.rmsDb.toFixed(1)}dB peak={Math.round(metrics.peakHz)}Hz peakDb={metrics.peakDb.toFixed(1)}
@@ -573,13 +525,10 @@ export default function RxPage() {
           </div>
         )}
 
-        {devMode && (
-          <div className="mt-3 rounded-xl border border-orange-200 bg-orange-50 p-3 text-xs text-orange-900">
-            ok={decoderStats.okFrames} crcFail={decoderStats.crcFail} lenInvalid={decoderStats.lenInvalid} decodeFail=
-            {decoderStats.decodeFail} syncLost={decoderStats.syncLost} resync={decoderStats.resyncCount} lastError=
-            {decoderStats.lastError ?? "-"}
-          </div>
-        )}
+        <div className="mt-3 rounded-xl border border-orange-200 bg-orange-50 p-3 text-xs text-orange-900">
+          ok={decoderStats.okFrames} lenInvalid={decoderStats.lenInvalid} decodeFail={decoderStats.decodeFail} resync=
+          {decoderStats.resyncCount} lastError={decoderStats.lastError ?? "-"}
+        </div>
 
         <div className="mt-4">
           <div className="mb-2 text-sm font-semibold text-slate-600">Decoded text</div>

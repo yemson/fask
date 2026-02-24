@@ -16,8 +16,12 @@ function App() {
     <div className="mx-auto min-h-screen w-full max-w-6xl px-4 pb-10 pt-6 sm:px-6 lg:px-8">
       <header className="mb-5 flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-[var(--line)] bg-[var(--panel)] px-5 py-4 backdrop-blur">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">FASK Lab</p>
-          <h1 className="text-xl font-bold text-slate-900 sm:text-2xl">Audio FSK Playground</h1>
+          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+            FASK Lab
+          </p>
+          <h1 className="text-xl font-bold text-slate-900 sm:text-2xl">
+            Audio FSK (V2)
+          </h1>
         </div>
 
         <nav className="flex items-center gap-2">

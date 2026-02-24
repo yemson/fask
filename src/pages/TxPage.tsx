@@ -4,13 +4,11 @@ import {
   FSK_F1_HZ,
   TS_PROFILE_MS,
   getTsSec,
-  readProtocolVersionFromStorage,
   readTsProfileFromStorage,
-  writeProtocolVersionToStorage,
   writeTsProfileToStorage,
 } from "../lib/fskConfig";
-import type { ProtocolVersion, TsProfile } from "../lib/fskConfig";
-import { buildFrameBitsV2, buildFrameBitsV3 } from "../lib/protocol";
+import type { TsProfile } from "../lib/fskConfig";
+import { buildFrameBitsV2 } from "../lib/protocol";
 import type { EncodedFrame } from "../lib/protocol";
 
 const TS_PROFILES: TsProfile[] = ["safe", "balanced", "fast"];
@@ -55,25 +53,11 @@ export default function TxPage() {
   const [frameBitsUI, setFrameBitsUI] = useState("");
   const [frameInfo, setFrameInfo] = useState<EncodedFrame | null>(null);
   const [txStatus, setTxStatus] = useState("idle");
-  const [devMode, setDevMode] = useState(false);
-  const [protocolVersion, setProtocolVersion] = useState<ProtocolVersion>(() =>
-    readProtocolVersionFromStorage(),
-  );
-  const [tsProfile, setTsProfile] = useState<TsProfile>(() =>
-    readTsProfileFromStorage(),
-  );
-
-  const seqRef = useRef(0);
+  const [tsProfile, setTsProfile] = useState<TsProfile>(() => readTsProfileFromStorage());
 
   useEffect(() => {
     writeTsProfileToStorage(tsProfile);
   }, [tsProfile]);
-
-  useEffect(() => {
-    writeProtocolVersionToStorage(devMode ? protocolVersion : "v3");
-  }, [devMode, protocolVersion]);
-
-  const effectiveProtocolVersion: ProtocolVersion = devMode ? protocolVersion : "v3";
 
   const audioRef = useRef<{
     ctx: AudioContext;
@@ -82,6 +66,7 @@ export default function TxPage() {
   } | null>(null);
 
   const Ts = getTsSec(tsProfile);
+
   const params = useMemo(
     () => ({
       f0: FSK_F0_HZ,
@@ -98,14 +83,13 @@ export default function TxPage() {
 
     const ctx = new AudioContext();
     const osc = ctx.createOscillator();
-    osc.type = "sine";
-
     const gain = ctx.createGain();
+
+    osc.type = "sine";
     gain.gain.value = 0;
 
     osc.connect(gain);
     gain.connect(ctx.destination);
-
     osc.start();
 
     audioRef.current = { ctx, osc, gain };
@@ -122,6 +106,7 @@ export default function TxPage() {
     } catch {
       console.error("Failed to stop oscillator");
     }
+
     try {
       await h.ctx.close();
     } catch {
@@ -142,8 +127,8 @@ export default function TxPage() {
     h.osc.frequency.cancelScheduledValues(now);
 
     for (let i = 0; i < bits.length; i++) {
-      const b = bits.charCodeAt(i);
-      const freq = b === 49 ? f1 : f0;
+      const bit = bits.charCodeAt(i);
+      const freq = bit === 49 ? f1 : f0;
       const t = t0 + i * Ts;
 
       h.osc.frequency.setValueAtTime(freq, t);
@@ -161,26 +146,16 @@ export default function TxPage() {
   };
 
   const buildFrame = (text: string) => {
-    const encoded =
-      effectiveProtocolVersion === "v3"
-        ? buildFrameBitsV3(text, seqRef.current++)
-        : buildFrameBitsV2(text);
+    const encoded = buildFrameBitsV2(text);
 
     setFrameInfo(encoded);
     setFrameBitsUI(encoded.bits);
     setPayloadBitsUI(encoded.payloadBits);
 
     const saving = calcSavingPercent(encoded.rawBytes, encoded.txBytes);
-    const mode = encoded.compressed ? "compressed" : "raw";
-    if (encoded.version === "v3") {
-      setTxStatus(
-        `frame ready (v3 seq=${encoded.seq}, ${mode}, ${encoded.txBytes}/${encoded.rawBytes}B, save ${saving.toFixed(1)}%)`,
-      );
-    } else {
-      setTxStatus(
-        `frame ready (v2 ${mode}, ${encoded.txBytes}/${encoded.rawBytes}B, save ${saving.toFixed(1)}%)`,
-      );
-    }
+    setTxStatus(
+      `frame ready (v2 ${encoded.compressed ? "compressed" : "raw"}, ${encoded.txBytes}/${encoded.rawBytes}B, save ${saving.toFixed(1)}%)`,
+    );
 
     return encoded;
   };
@@ -198,7 +173,7 @@ export default function TxPage() {
       const encoded = buildFrame(inputValue);
       await playFrameBitsFSK(encoded.bits);
       setTxStatus(
-        `sent ${encoded.bits.length} bits in ${(encoded.bits.length * Ts).toFixed(2)}s (${encoded.version}, ${encoded.compressed ? "compressed" : "raw"})`,
+        `sent ${encoded.bits.length} bits in ${(encoded.bits.length * Ts).toFixed(2)}s (${encoded.compressed ? "compressed" : "raw"})`,
       );
     } catch (error) {
       setTxStatus(`send error: ${getErrorMessage(error)}`);
@@ -210,7 +185,7 @@ export default function TxPage() {
   return (
     <section className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
       <div className={cardClass()}>
-        <h2 className="mb-4 text-xl font-bold text-slate-900">FSK TX</h2>
+        <h2 className="mb-4 text-xl font-bold text-slate-900">FSK TX (V2)</h2>
 
         <form
           onSubmit={(e) => {
@@ -226,6 +201,7 @@ export default function TxPage() {
             placeholder="전송할 텍스트를 입력하세요"
             className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-teal-500 focus:ring"
           />
+
           <button type="submit" className={buttonClass("sub")}>
             Build
           </button>
@@ -250,46 +226,18 @@ export default function TxPage() {
           ))}
         </div>
 
-        <div className="mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-700">
-          <label className="flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5">
-            <input type="checkbox" checked={devMode} onChange={(e) => setDevMode(e.target.checked)} />
-            Developer mode
-          </label>
-
-          <button
-            type="button"
-            disabled={!devMode || protocolVersion === "v3"}
-            onClick={() => setProtocolVersion("v3")}
-            className={chipClass(effectiveProtocolVersion === "v3")}
-          >
-            V3
-          </button>
-          <button
-            type="button"
-            disabled={!devMode || protocolVersion === "v2"}
-            onClick={() => setProtocolVersion("v2")}
-            className={chipClass(effectiveProtocolVersion === "v2")}
-            title={!devMode ? "Enable developer mode for legacy V2" : ""}
-          >
-            Legacy V2
-          </button>
-        </div>
-
         <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-700">
           <p>
             Params: f0={params.f0}Hz, f1={params.f1}Hz, Ts={Math.round(Ts * 1000)}ms
           </p>
-          <p className="mt-1">Profile: {profileLabel(tsProfile)} | Protocol: {effectiveProtocolVersion}</p>
+          <p className="mt-1">Profile: {profileLabel(tsProfile)} | Protocol: v2</p>
           <p className="mt-1 font-semibold text-slate-900">Status: {txStatus}</p>
         </div>
 
         {frameInfo && (
           <div className="mt-3 rounded-xl border border-teal-200 bg-teal-50 p-3 text-xs text-teal-900">
-            version={frameInfo.version} rawBytes={frameInfo.rawBytes} txBytes={frameInfo.txBytes} compressed=
+            rawBytes={frameInfo.rawBytes} txBytes={frameInfo.txBytes} compressed=
             {frameInfo.compressed ? "on" : "off"} saving={saving.toFixed(1)}%
-            {frameInfo.version === "v3"
-              ? ` seq=${frameInfo.seq} crc=0x${frameInfo.crc16.toString(16).padStart(4, "0")}`
-              : ""}
           </div>
         )}
       </div>
