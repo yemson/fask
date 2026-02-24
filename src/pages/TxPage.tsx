@@ -30,6 +30,25 @@ function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function cardClass() {
+  return "rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-5 shadow-lg shadow-slate-200/60 backdrop-blur";
+}
+
+function chipClass(active: boolean) {
+  return [
+    "rounded-full border px-3 py-1.5 text-xs font-semibold transition",
+    active
+      ? "border-teal-700 bg-teal-700 text-white"
+      : "border-slate-300 bg-white text-slate-700 hover:border-teal-600 hover:text-teal-700",
+  ].join(" ");
+}
+
+function buttonClass(kind: "primary" | "sub" = "sub") {
+  return kind === "primary"
+    ? "rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700"
+    : "rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 hover:border-teal-600 hover:text-teal-700";
+}
+
 export default function TxPage() {
   const [inputValue, setInputValue] = useState("");
   const [payloadBitsUI, setPayloadBitsUI] = useState("");
@@ -189,109 +208,109 @@ export default function TxPage() {
   const saving = frameInfo ? calcSavingPercent(frameInfo.rawBytes, frameInfo.txBytes) : 0;
 
   return (
-    <div style={{ padding: 16, fontFamily: "system-ui" }}>
-      <h2>FSK TX</h2>
+    <section className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
+      <div className={cardClass()}>
+        <h2 className="mb-4 text-xl font-bold text-slate-900">FSK TX</h2>
 
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          handleBuild();
-        }}
-        style={{ display: "flex", gap: 8 }}
-      >
-        <input
-          value={inputValue}
-          onChange={(e) => setInputValue(e.target.value)}
-          type="text"
-          placeholder="Enter text"
-          style={{ flex: 1 }}
-        />
-        <button type="submit">Build Frame</button>
-        <button type="button" onClick={handleSend}>
-          Send (FSK)
-        </button>
-        <button type="button" onClick={stopAudio}>
-          Stop Audio
-        </button>
-      </form>
-
-      <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-        {TS_PROFILES.map((profile) => (
-          <button
-            key={profile}
-            type="button"
-            onClick={() => setTsProfile(profile)}
-            style={{
-              padding: "6px 10px",
-              borderRadius: 8,
-              border: "1px solid #d0d7de",
-              background: tsProfile === profile ? "#111" : "#fff",
-              color: tsProfile === profile ? "#fff" : "#111",
-            }}
-          >
-            {profileLabel(profile)} {TS_PROFILE_MS[profile]}ms
-          </button>
-        ))}
-      </div>
-
-      <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-        <label style={{ fontSize: 12 }}>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleBuild();
+          }}
+          className="flex flex-col gap-2 sm:flex-row"
+        >
           <input
-            type="checkbox"
-            checked={devMode}
-            onChange={(e) => setDevMode(e.target.checked)}
-            style={{ marginRight: 6 }}
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            type="text"
+            placeholder="전송할 텍스트를 입력하세요"
+            className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-teal-500 focus:ring"
           />
-          Developer mode
-        </label>
+          <button type="submit" className={buttonClass("sub")}>
+            Build
+          </button>
+          <button type="button" onClick={handleSend} className={buttonClass("primary")}>
+            Send
+          </button>
+          <button type="button" onClick={stopAudio} className={buttonClass("sub")}>
+            Stop
+          </button>
+        </form>
 
-        <button
-          type="button"
-          disabled={!devMode || protocolVersion === "v3"}
-          onClick={() => setProtocolVersion("v3")}
-          style={{ opacity: !devMode ? 0.6 : 1 }}
-        >
-          V3
-        </button>
-        <button
-          type="button"
-          disabled={!devMode || protocolVersion === "v2"}
-          onClick={() => setProtocolVersion("v2")}
-          style={{ opacity: !devMode ? 0.6 : 1 }}
-          title={!devMode ? "Enable developer mode for legacy V2" : ""}
-        >
-          Legacy V2
-        </button>
-      </div>
-
-      <div style={{ marginTop: 12, fontSize: 12, opacity: 0.85 }}>
-        Params: f0={params.f0}Hz, f1={params.f1}Hz, Ts={Math.round(Ts * 1000)}ms
-        {" "}
-        (profile: {profileLabel(tsProfile)}, protocol: {effectiveProtocolVersion})
-      </div>
-
-      <div style={{ marginTop: 8, fontSize: 12 }}>Status: {txStatus}</div>
-
-      {frameInfo && (
-        <div style={{ marginTop: 8, fontSize: 12, opacity: 0.9 }}>
-          version={frameInfo.version} rawBytes={frameInfo.rawBytes} txBytes={frameInfo.txBytes}
-          {" "}
-          compressed={frameInfo.compressed ? "on" : "off"} saving={saving.toFixed(1)}%
-          {frameInfo.version === "v3" ? ` seq=${frameInfo.seq} crc=0x${frameInfo.crc16.toString(16).padStart(4, "0")}` : ""}
-        </div>
-      )}
-
-      <div style={{ marginTop: 12 }}>
-        <p style={{ margin: "8px 0 4px" }}>Payload bits:</p>
-        <div style={{ wordBreak: "break-all", fontSize: 12 }}>
-          {payloadBitsUI}
+        <div className="mt-4 flex flex-wrap gap-2">
+          {TS_PROFILES.map((profile) => (
+            <button
+              key={profile}
+              type="button"
+              onClick={() => setTsProfile(profile)}
+              className={chipClass(tsProfile === profile)}
+            >
+              {profileLabel(profile)} {TS_PROFILE_MS[profile]}ms
+            </button>
+          ))}
         </div>
 
-        <p style={{ margin: "12px 0 4px" }}>Frame bits:</p>
-        <div style={{ wordBreak: "break-all", fontSize: 12 }}>
-          {frameBitsUI}
+        <div className="mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-700">
+          <label className="flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5">
+            <input type="checkbox" checked={devMode} onChange={(e) => setDevMode(e.target.checked)} />
+            Developer mode
+          </label>
+
+          <button
+            type="button"
+            disabled={!devMode || protocolVersion === "v3"}
+            onClick={() => setProtocolVersion("v3")}
+            className={chipClass(effectiveProtocolVersion === "v3")}
+          >
+            V3
+          </button>
+          <button
+            type="button"
+            disabled={!devMode || protocolVersion === "v2"}
+            onClick={() => setProtocolVersion("v2")}
+            className={chipClass(effectiveProtocolVersion === "v2")}
+            title={!devMode ? "Enable developer mode for legacy V2" : ""}
+          >
+            Legacy V2
+          </button>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-700">
+          <p>
+            Params: f0={params.f0}Hz, f1={params.f1}Hz, Ts={Math.round(Ts * 1000)}ms
+          </p>
+          <p className="mt-1">Profile: {profileLabel(tsProfile)} | Protocol: {effectiveProtocolVersion}</p>
+          <p className="mt-1 font-semibold text-slate-900">Status: {txStatus}</p>
+        </div>
+
+        {frameInfo && (
+          <div className="mt-3 rounded-xl border border-teal-200 bg-teal-50 p-3 text-xs text-teal-900">
+            version={frameInfo.version} rawBytes={frameInfo.rawBytes} txBytes={frameInfo.txBytes} compressed=
+            {frameInfo.compressed ? "on" : "off"} saving={saving.toFixed(1)}%
+            {frameInfo.version === "v3"
+              ? ` seq=${frameInfo.seq} crc=0x${frameInfo.crc16.toString(16).padStart(4, "0")}`
+              : ""}
+          </div>
+        )}
+      </div>
+
+      <div className={cardClass()}>
+        <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500">Frame Inspector</h3>
+
+        <div className="mt-4">
+          <p className="mb-2 text-xs font-semibold text-slate-600">Payload bits</p>
+          <pre className="mono max-h-40 overflow-auto rounded-xl border border-slate-200 bg-white p-3 text-[11px] text-slate-700">
+            {payloadBitsUI || "(none)"}
+          </pre>
+        </div>
+
+        <div className="mt-4">
+          <p className="mb-2 text-xs font-semibold text-slate-600">Frame bits</p>
+          <pre className="mono max-h-[22rem] overflow-auto rounded-xl border border-slate-200 bg-white p-3 text-[11px] text-slate-700">
+            {frameBitsUI || "(none)"}
+          </pre>
         </div>
       </div>
-    </div>
+    </section>
   );
 }

@@ -35,31 +35,31 @@ function getDiagnosisMeta(diagnosis: SignalDiagnosis) {
     case "no_input":
       return {
         label: "No Input",
-        color: "#6b7280",
-        detail: "Mic level is too low. Move closer or increase speaker volume.",
+        color: "#64748b",
+        detail: "입력 레벨이 낮습니다. 마이크 거리와 볼륨을 올려보세요.",
       };
     case "ambient_noise":
       return {
         label: "Ambient Noise",
         color: "#ea580c",
-        detail: "Noise is present but FSK tones are not dominant.",
+        detail: "배경 소음 비중이 높아 FSK 톤 대비가 약합니다.",
       };
     case "likely_fsk":
       return {
         label: "Likely FSK",
-        color: "#16a34a",
-        detail: "Tone contrast is strong enough for decoding.",
+        color: "#0f766e",
+        detail: "톤 대비가 충분해 디코딩 가능성이 높습니다.",
       };
     case "mismatch_freq_or_timing":
       return {
         label: "Mismatch",
-        color: "#2563eb",
-        detail: "Signal exists but frequency or timing likely differs.",
+        color: "#1d4ed8",
+        detail: "주파수 또는 Ts 프로파일 불일치 가능성이 있습니다.",
       };
     default:
       return {
         label: "Unknown",
-        color: "#6b7280",
+        color: "#64748b",
         detail: "",
       };
   }
@@ -76,9 +76,7 @@ export default function SignalDashboard({
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const levelPercent = metrics
-    ? clamp((metrics.rmsDb - -90) / 70, 0, 1) * 100
-    : 0;
+  const levelPercent = metrics ? clamp((metrics.rmsDb - -90) / 70, 0, 1) * 100 : 0;
   const diagnosisMeta = getDiagnosisMeta(diagnosis);
 
   useEffect(() => {
@@ -101,10 +99,10 @@ export default function SignalDashboard({
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-    ctx.fillStyle = "#f8fafc";
+    ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, cssWidth, cssHeight);
 
-    ctx.strokeStyle = "#e5e7eb";
+    ctx.strokeStyle = "#e2e8f0";
     ctx.lineWidth = 1;
     for (let hz = 0; hz <= MAX_SPECTRUM_HZ; hz += 500) {
       const x = hzToX(hz, cssWidth);
@@ -125,7 +123,7 @@ export default function SignalDashboard({
 
     if (!spectrum || spectrum.length < 2) {
       ctx.fillStyle = "#64748b";
-      ctx.font = "12px system-ui";
+      ctx.font = "12px Space Grotesk";
       ctx.fillText("No spectrum data yet.", 10, 20);
     } else {
       ctx.strokeStyle = "#0f172a";
@@ -135,11 +133,8 @@ export default function SignalDashboard({
         const hz = (i / (spectrum.length - 1)) * MAX_SPECTRUM_HZ;
         const x = hzToX(hz, cssWidth);
         const y = dbToY(spectrum[i], cssHeight);
-        if (i === 0) {
-          ctx.moveTo(x, y);
-        } else {
-          ctx.lineTo(x, y);
-        }
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
       }
       ctx.stroke();
     }
@@ -154,7 +149,7 @@ export default function SignalDashboard({
       ctx.stroke();
 
       ctx.fillStyle = color;
-      ctx.font = "12px system-ui";
+      ctx.font = "12px Space Grotesk";
       ctx.fillText(label, clamp(x + 4, 4, cssWidth - 48), 14);
     };
 
@@ -164,73 +159,43 @@ export default function SignalDashboard({
     if (metrics) {
       const peakX = hzToX(metrics.peakHz, cssWidth);
       const peakY = dbToY(metrics.peakDb, cssHeight);
-      ctx.fillStyle = "#2563eb";
+      ctx.fillStyle = "#1d4ed8";
       ctx.beginPath();
       ctx.arc(peakX, peakY, 3, 0, Math.PI * 2);
       ctx.fill();
     }
 
     ctx.fillStyle = "#334155";
-    ctx.font = "11px system-ui";
+    ctx.font = "11px IBM Plex Mono";
     ctx.fillText("0 Hz", 4, cssHeight - 6);
-    ctx.fillText("4 kHz", cssWidth - 34, cssHeight - 6);
+    ctx.fillText("4 kHz", cssWidth - 40, cssHeight - 6);
   }, [f0, f1, metrics, spectrum]);
 
   return (
-    <div
-      style={{
-        marginTop: 12,
-        padding: 12,
-        border: "1px solid #dbe2ea",
-        borderRadius: 10,
-        background: "#ffffff",
-      }}
-    >
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-        <div style={{ fontSize: 13, fontWeight: 600 }}>Input level (dBFS)</div>
-        <div style={{ fontSize: 12, color: "#475569" }}>
-          {metrics ? `${metrics.rmsDb.toFixed(1)} dB` : "-"}
-        </div>
+    <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs font-semibold uppercase tracking-wider text-slate-600">Input level</div>
+        <div className="mono text-xs text-slate-700">{metrics ? `${metrics.rmsDb.toFixed(1)} dB` : "-"}</div>
       </div>
 
-      <div
-        style={{
-          marginTop: 8,
-          width: "100%",
-          height: 10,
-          background: "#e2e8f0",
-          borderRadius: 999,
-          overflow: "hidden",
-        }}
-      >
+      <div className="mt-2 h-2.5 overflow-hidden rounded-full bg-slate-200">
         <div
-          style={{
-            width: `${levelPercent}%`,
-            height: "100%",
-            background: running ? "#2563eb" : "#94a3b8",
-            transition: "width 100ms linear",
-          }}
+          className={running ? "h-full bg-teal-600" : "h-full bg-slate-400"}
+          style={{ width: `${levelPercent}%`, transition: "width 100ms linear" }}
         />
       </div>
 
-      <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8 }}>
+      <div className="mt-3 flex items-center gap-2">
         <span
-          style={{
-            display: "inline-block",
-            padding: "4px 8px",
-            borderRadius: 999,
-            fontSize: 12,
-            fontWeight: 700,
-            color: "#ffffff",
-            background: diagnosisMeta.color,
-          }}
+          className="rounded-full px-2.5 py-1 text-[11px] font-bold text-white"
+          style={{ background: diagnosisMeta.color }}
         >
           {diagnosisMeta.label}
         </span>
-        <span style={{ fontSize: 12, color: "#475569" }}>{diagnosisMeta.detail}</span>
+        <span className="text-xs text-slate-600">{diagnosisMeta.detail}</span>
       </div>
 
-      <div ref={wrapRef} style={{ marginTop: 12, minHeight: CHART_MIN_HEIGHT }}>
+      <div ref={wrapRef} className="mt-3 min-h-[140px] rounded-lg border border-slate-200">
         <canvas ref={canvasRef} />
       </div>
     </div>

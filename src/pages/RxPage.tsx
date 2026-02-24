@@ -171,7 +171,7 @@ function nextPowerOfTwo(n: number) {
   return v;
 }
 
-function chooseBitByMultiWindow(
+function chooseBitByTripleWindow(
   samples: Float32Array<ArrayBufferLike>,
   sampleRate: number,
   f0: number,
@@ -181,11 +181,9 @@ function chooseBitByMultiWindow(
   const windowLen = Math.max(64, Math.floor(n / 2));
   const centers = [Math.floor(n * 0.25), Math.floor(n * 0.5), Math.floor(n * 0.75)];
 
-  let best = {
-    score: -Infinity,
-    p0: 0,
-    p1: 0,
-  };
+  const bits: ("0" | "1")[] = [];
+  let p0Sum = 0;
+  let p1Sum = 0;
 
   for (let i = 0; i < centers.length; i++) {
     const center = centers[i];
@@ -195,30 +193,23 @@ function chooseBitByMultiWindow(
 
     const p0 = goertzelPower(view, sampleRate, f0);
     const p1 = goertzelPower(view, sampleRate, f1);
-    const score = Math.abs(p1 - p0);
-    if (score > best.score) {
-      best = { score, p0, p1 };
-    }
+    p0Sum += p0;
+    p1Sum += p1;
+    bits.push(p1 > p0 ? "1" : "0");
   }
 
+  const ones = bits.filter((b) => b === "1").length;
+  const decodedBit = ones >= 2 ? "1" : "0";
+
+  const p0Avg = p0Sum / bits.length;
+  const p1Avg = p1Sum / bits.length;
+
   return {
-    p0: best.p0,
-    p1: best.p1,
-    bit: best.p1 > best.p0 ? "1" : "0",
-    snr: Math.max(best.p0, best.p1) / (Math.min(best.p0, best.p1) + EPS),
+    p0: p0Avg,
+    p1: p1Avg,
+    bit: decodedBit,
+    snr: Math.max(p0Avg, p1Avg) / (Math.min(p0Avg, p1Avg) + EPS),
   };
-}
-
-function stabilizeBit(bitWindow: string[], nextBit: string, maxLen = 8) {
-  bitWindow.push(nextBit);
-  if (bitWindow.length > maxLen) bitWindow.shift();
-
-  const ones = bitWindow.reduce((acc, b) => acc + (b === "1" ? 1 : 0), 0);
-  const zeros = bitWindow.length - ones;
-
-  if (ones >= 5) return "1";
-  if (zeros >= 5) return "0";
-  return nextBit;
 }
 
 function initialDecoderStats(): DecoderStats {
@@ -231,6 +222,19 @@ function initialDecoderStats(): DecoderStats {
     resyncCount: 0,
     lastError: null,
   };
+}
+
+function cardClass() {
+  return "rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-5 shadow-lg shadow-slate-200/60 backdrop-blur";
+}
+
+function chipClass(active: boolean) {
+  return [
+    "rounded-full border px-3 py-1.5 text-xs font-semibold transition",
+    active
+      ? "border-teal-700 bg-teal-700 text-white"
+      : "border-slate-300 bg-white text-slate-700 hover:border-teal-600 hover:text-teal-700",
+  ].join(" ");
 }
 
 export default function RxPage() {
@@ -256,9 +260,7 @@ export default function RxPage() {
   } | null>(null);
   const [metrics, setMetrics] = useState<SignalMetrics | null>(null);
   const [diagnosis, setDiagnosis] = useState<SignalDiagnosis>("no_input");
-  const [spectrum, setSpectrum] = useState<Float32Array<ArrayBuffer> | null>(
-    null,
-  );
+  const [spectrum, setSpectrum] = useState<Float32Array<ArrayBuffer> | null>(null);
   const [devMode, setDevMode] = useState(false);
   const [allowV2Fallback, setAllowV2Fallback] = useState(false);
 
@@ -282,7 +284,6 @@ export default function RxPage() {
   const fdRef = useRef<Float32Array<ArrayBuffer> | null>(null);
   const lastSampleAtRef = useRef<number>(0);
   const lastUiUpdateAtRef = useRef<number>(0);
-  const bitHistoryRef = useRef<string[]>([]);
   const decoderRef = useRef<RxBitDecoder>(new RxBitDecoder({ allowV2Fallback: false }));
 
   const stopRx = useCallback(async () => {
@@ -309,7 +310,6 @@ export default function RxPage() {
     tdRef.current = null;
     tdFftRef.current = null;
     fdRef.current = null;
-    bitHistoryRef.current = [];
     setLastBit("");
     setDebug(null);
     setMetrics(null);
@@ -334,7 +334,6 @@ export default function RxPage() {
     setMetrics(null);
     setDiagnosis("no_input");
     setSpectrum(null);
-    bitHistoryRef.current = [];
 
     resetDecoder();
 
@@ -380,25 +379,11 @@ export default function RxPage() {
       td.set(tdFft.subarray(tdFft.length - td.length));
       h.analyser.getFloatFrequencyData(fd);
 
-      const sample = chooseBitByMultiWindow(td, h.ctx.sampleRate, f0, f1);
+      const sample = chooseBitByTripleWindow(td, h.ctx.sampleRate, f0, f1);
       const rmsDb = computeRmsDb(td);
-      const noiseFloorDb = estimateNoiseFloorDb(
-        fd,
-        h.ctx.sampleRate,
-        MAX_SPECTRUM_HZ,
-      );
-      const { peakHz, peakDb } = findPeak(
-        fd,
-        h.ctx.sampleRate,
-        MAX_SPECTRUM_HZ,
-      );
-      const toneDeltaDb = calcToneDeltaDb(
-        fd,
-        h.ctx.sampleRate,
-        f0,
-        f1,
-        noiseFloorDb,
-      );
+      const noiseFloorDb = estimateNoiseFloorDb(fd, h.ctx.sampleRate, MAX_SPECTRUM_HZ);
+      const { peakHz, peakDb } = findPeak(fd, h.ctx.sampleRate, MAX_SPECTRUM_HZ);
+      const toneDeltaDb = calcToneDeltaDb(fd, h.ctx.sampleRate, f0, f1, noiseFloorDb);
 
       const nextMetrics: SignalMetrics = {
         rmsDb,
@@ -416,28 +401,31 @@ export default function RxPage() {
         const steps = Math.floor((now - lastSampleAtRef.current) / Ts);
         lastSampleAtRef.current += steps * Ts;
 
-        const stableBit = stabilizeBit(bitHistoryRef.current, sample.bit);
-        setLastBit(stableBit);
+        let latestEvent = null;
+        for (let i = 0; i < steps; i++) {
+          latestEvent = decoderRef.current.consumeBit(sample.bit);
+        }
 
-        const event = decoderRef.current.consumeBit(stableBit);
-        if (event) {
-          if (event.kind === "status") {
-            setStatus(event.message);
-            if (typeof event.lenBytes === "number") {
-              setDecodedLen(event.lenBytes);
+        setLastBit(sample.bit);
+
+        if (latestEvent) {
+          if (latestEvent.kind === "status") {
+            setStatus(latestEvent.message);
+            if (typeof latestEvent.lenBytes === "number") {
+              setDecodedLen(latestEvent.lenBytes);
             }
           }
 
-          if (event.kind === "error") {
-            setStatus(event.message);
+          if (latestEvent.kind === "error") {
+            setStatus(latestEvent.message);
           }
 
-          if (event.kind === "frame") {
-            setDecodedText(event.frame.text);
-            setDecodedLen(event.frame.lenBytes);
-            setDecodedVersion(event.frame.version);
-            setDecodedSeq(event.frame.seq);
-            setStatus(event.message);
+          if (latestEvent.kind === "frame") {
+            setDecodedText(latestEvent.frame.text);
+            setDecodedLen(latestEvent.frame.lenBytes);
+            setDecodedVersion(latestEvent.frame.version);
+            setDecodedSeq(latestEvent.frame.seq);
+            setStatus(latestEvent.message);
           }
 
           setDecoderStats(decoderRef.current.getStats());
@@ -474,138 +462,129 @@ export default function RxPage() {
   const tsLabel = useMemo(() => profileLabel(tsProfile), [tsProfile]);
 
   return (
-    <div style={{ padding: 16, fontFamily: "system-ui" }}>
-      <h2>FSK RX</h2>
+    <section className="grid gap-4 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
+      <div className={cardClass()}>
+        <h2 className="mb-4 text-xl font-bold text-slate-900">FSK RX</h2>
 
-      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-        {!running ? (
-          <button
-            onClick={async () => {
-              try {
-                await startRx();
-              } catch (error) {
-                setStatus(`start error: ${getErrorMessage(error)}`);
-                await stopRx();
-              }
-            }}
-          >
-            Start RX (Mic)
-          </button>
-        ) : (
-          <button onClick={stopRx}>Stop</button>
-        )}
+        <div className="flex flex-wrap items-center gap-2">
+          {!running ? (
+            <button
+              onClick={async () => {
+                try {
+                  await startRx();
+                } catch (error) {
+                  setStatus(`start error: ${getErrorMessage(error)}`);
+                  await stopRx();
+                }
+              }}
+              className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700"
+            >
+              Start RX
+            </button>
+          ) : (
+            <button
+              onClick={stopRx}
+              className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800"
+            >
+              Stop
+            </button>
+          )}
 
-        <div style={{ fontSize: 12, opacity: 0.85 }}>
-          f0={f0}Hz, f1={f1}Hz, Ts={Math.round(Ts * 1000)}ms (profile: {tsLabel}, proto: v3)
+          <span className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700">
+            f0={f0}Hz f1={f1}Hz Ts={Math.round(Ts * 1000)}ms ({tsLabel}, v3)
+          </span>
         </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          {TS_PROFILES.map((profile) => (
+            <button
+              key={profile}
+              type="button"
+              disabled={running}
+              onClick={() => setTsProfile(profile)}
+              className={chipClass(tsProfile === profile)}
+              title={running ? "Stop RX before changing Ts profile" : ""}
+            >
+              {profileLabel(profile)} {TS_PROFILE_MS[profile]}ms
+            </button>
+          ))}
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-700">
+          <label className="flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5">
+            <input
+              type="checkbox"
+              checked={devMode}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setDevMode(next);
+                if (!next) setAllowV2Fallback(false);
+              }}
+            />
+            Developer mode
+          </label>
+
+          <label className="flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5">
+            <input
+              type="checkbox"
+              checked={allowV2Fallback}
+              disabled={!devMode || running}
+              onChange={(e) => setAllowV2Fallback(e.target.checked)}
+            />
+            V2 fallback
+          </label>
+        </div>
+
+        <SignalDashboard
+          running={running}
+          f0={f0}
+          f1={f1}
+          metrics={metrics}
+          diagnosis={diagnosis}
+          spectrum={spectrum}
+        />
       </div>
 
-      <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
-        {TS_PROFILES.map((profile) => (
-          <button
-            key={profile}
-            type="button"
-            disabled={running}
-            onClick={() => setTsProfile(profile)}
-            style={{
-              padding: "6px 10px",
-              borderRadius: 8,
-              border: "1px solid #d0d7de",
-              background: tsProfile === profile ? "#111" : "#fff",
-              color: tsProfile === profile ? "#fff" : "#111",
-              opacity: running ? 0.7 : 1,
-            }}
-            title={running ? "Stop RX before changing Ts profile" : ""}
-          >
-            {profileLabel(profile)} {TS_PROFILE_MS[profile]}ms
-          </button>
-        ))}
-      </div>
+      <div className={cardClass()}>
+        <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500">Decoder</h3>
 
-      <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-        <label style={{ fontSize: 12 }}>
-          <input
-            type="checkbox"
-            checked={devMode}
-            onChange={(e) => {
-              const next = e.target.checked;
-              setDevMode(next);
-              if (!next) setAllowV2Fallback(false);
-            }}
-            style={{ marginRight: 6 }}
-          />
-          Developer mode
-        </label>
-
-        <label style={{ fontSize: 12, opacity: devMode ? 1 : 0.6 }}>
-          <input
-            type="checkbox"
-            checked={allowV2Fallback}
-            disabled={!devMode || running}
-            onChange={(e) => setAllowV2Fallback(e.target.checked)}
-            style={{ marginRight: 6 }}
-          />
-          V2 fallback decode
-        </label>
-      </div>
-
-      <SignalDashboard
-        running={running}
-        f0={f0}
-        f1={f1}
-        metrics={metrics}
-        diagnosis={diagnosis}
-        spectrum={spectrum}
-      />
-
-      <div style={{ marginTop: 10 }}>
-        <div>Status: {status}</div>
-        <div>
-          Last bit: <b>{lastBit || "-"}</b>
+        <div className="mt-4 grid gap-2 text-sm">
+          <div className="rounded-xl border border-slate-200 bg-white p-3">Status: {status}</div>
+          <div className="rounded-xl border border-slate-200 bg-white p-3">Last bit: <b>{lastBit || "-"}</b></div>
+          <div className="rounded-xl border border-slate-200 bg-white p-3">LEN: {decodedLen ?? "-"}</div>
+          <div className="rounded-xl border border-slate-200 bg-white p-3">
+            Last frame: {decodedVersion ?? "-"}
+            {decodedSeq !== null ? ` (seq=${decodedSeq})` : ""}
+          </div>
         </div>
-        <div>LEN: {decodedLen ?? "-"}</div>
-        <div>
-          Last frame: {decodedVersion ?? "-"}
-          {decodedSeq !== null ? ` (seq=${decodedSeq})` : ""}
-        </div>
+
         {debug && (
-          <div style={{ fontSize: 12, opacity: 0.85 }}>
-            p0={debug.p0.toExponential(2)} p1={debug.p1.toExponential(2)} snr~
-            {debug.snr.toFixed(2)}
+          <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-700">
+            p0={debug.p0.toExponential(2)} p1={debug.p1.toExponential(2)} snr~{debug.snr.toFixed(2)}
           </div>
         )}
         {metrics && (
-          <div style={{ fontSize: 12, opacity: 0.85 }}>
-            rms={metrics.rmsDb.toFixed(1)}dB peak={Math.round(metrics.peakHz)}Hz
-            peakDb={metrics.peakDb.toFixed(1)} noiseFloor=
-            {metrics.noiseFloorDb.toFixed(1)} toneDelta=
-            {metrics.toneDeltaDb.toFixed(1)}dB
+          <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-700">
+            rms={metrics.rmsDb.toFixed(1)}dB peak={Math.round(metrics.peakHz)}Hz peakDb={metrics.peakDb.toFixed(1)}
+            noiseFloor={metrics.noiseFloorDb.toFixed(1)} toneDelta={metrics.toneDeltaDb.toFixed(1)}dB
           </div>
         )}
-      </div>
 
-      {devMode && (
-        <div style={{ marginTop: 10, fontSize: 12, opacity: 0.9 }}>
-          decoder: ok={decoderStats.okFrames} crcFail={decoderStats.crcFail} lenInvalid=
-          {decoderStats.lenInvalid} decodeFail={decoderStats.decodeFail} syncLost=
-          {decoderStats.syncLost} resync={decoderStats.resyncCount} lastError=
-          {decoderStats.lastError ?? "-"}
+        {devMode && (
+          <div className="mt-3 rounded-xl border border-orange-200 bg-orange-50 p-3 text-xs text-orange-900">
+            ok={decoderStats.okFrames} crcFail={decoderStats.crcFail} lenInvalid={decoderStats.lenInvalid} decodeFail=
+            {decoderStats.decodeFail} syncLost={decoderStats.syncLost} resync={decoderStats.resyncCount} lastError=
+            {decoderStats.lastError ?? "-"}
+          </div>
+        )}
+
+        <div className="mt-4">
+          <div className="mb-2 text-sm font-semibold text-slate-600">Decoded text</div>
+          <pre className="mono min-h-40 whitespace-pre-wrap rounded-xl border border-slate-200 bg-white p-3 text-[12px] text-slate-700">
+            {decodedText || "(none)"}
+          </pre>
         </div>
-      )}
-
-      <div style={{ marginTop: 12 }}>
-        <div style={{ marginBottom: 6 }}>Decoded text:</div>
-        <pre
-          style={{
-            padding: 12,
-            border: "1px solid #ddd",
-            borderRadius: 8,
-            whiteSpace: "pre-wrap",
-          }}
-        >
-          {decodedText || "(none)"}
-        </pre>
       </div>
-    </div>
+    </section>
   );
 }
