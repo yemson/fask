@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { SignalDiagnosis, SignalMetrics } from "../../pages/RxPage";
+import type { SignalDiagnosis, SignalMetrics } from "../../lib/signal";
 
 type SignalDashboardProps = {
   running: boolean;
