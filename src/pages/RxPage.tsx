@@ -399,12 +399,15 @@ export default function RxPage() {
       const now = h.ctx.currentTime;
       if (now - lastSampleAtRef.current >= Ts) {
         const steps = Math.floor((now - lastSampleAtRef.current) / Ts);
-        lastSampleAtRef.current += steps * Ts;
-
-        let latestEvent = null;
-        for (let i = 0; i < steps; i++) {
-          latestEvent = decoderRef.current.consumeBit(sample.bit);
+        if (steps > 1) {
+          // If UI/audio loop lags, do not inject duplicated bits into the decoder.
+          // Resync sampling clock to "now" and consume only one fresh symbol.
+          lastSampleAtRef.current = now;
+        } else {
+          lastSampleAtRef.current += Ts;
         }
+
+        const latestEvent = decoderRef.current.consumeBit(sample.bit);
 
         setLastBit(sample.bit);
 

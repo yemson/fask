@@ -10,7 +10,7 @@ import {
 } from "./protocol";
 
 const PREAMBLE_MATCH_MIN = 28;
-const SYNC_MAX_ERRORS = 2;
+const SYNC_MAX_ERRORS = 3;
 const MAX_PAYLOAD_BYTES = 0x7fff;
 
 const INVERTED_PREAMBLE_BITS = PREAMBLE_BITS_V2.split("")
